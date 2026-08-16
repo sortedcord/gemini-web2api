@@ -1,6 +1,8 @@
 import base64
 import http.client
 import json
+import os
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -21,7 +23,11 @@ from gemini_web2api.gemini import (
 from gemini_web2api.generated_image import (
     download_generated_image,
     extract_generation_result,
+    generated_image_store_enabled,
+    open_stored_generated_image,
     resolve_generated_image_url,
+    store_generated_image,
+    validate_generated_image_store,
     validate_generated_image_url,
 )
 from gemini_web2api.multimodal import _get_page_tokens, fetch_image_bytes
@@ -259,6 +265,92 @@ class GeneratedImageTests(unittest.TestCase):
         response.iter_content.return_value = [b"\x89PNG\r\n\x1a\n"]
         with self.assertRaises(ValueError):
             download_generated_image("https://lh3.googleusercontent.com/a")
+
+
+class GeneratedImageStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        self.directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+        self.directory.cleanup()
+
+    def test_persistent_store_is_optional(self):
+        CONFIG["generated_image_store_dir"] = None
+        CONFIG["generated_image_base_url"] = None
+
+        self.assertFalse(generated_image_store_enabled())
+        self.assertIsNone(store_generated_image(b"\x89PNG\r\n\x1a\n", "image/png"))
+
+    def test_stores_validated_image_atomically_with_private_mode(self):
+        CONFIG["generated_image_store_dir"] = self.directory.name
+        CONFIG["generated_image_base_url"] = "https://example.test/generated-images"
+        data = b"\x89PNG\r\n\x1a\n"
+        os.chmod(self.directory.name, 0o755)
+
+        url = store_generated_image(data, "image/png")
+        filename = url.rsplit("/", 1)[1]
+        descriptor, mime, size = open_stored_generated_image(filename)
+
+        self.assertTrue(generated_image_store_enabled())
+        self.assertEqual(mime, "image/png")
+        self.assertEqual(size, len(data))
+        with os.fdopen(descriptor, "rb") as stored:
+            self.assertEqual(stored.read(), data)
+        path = os.path.join(self.directory.name, filename)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(self.directory.name).st_mode & 0o777, 0o700)
+        self.assertIsNone(open_stored_generated_image("../cookie.txt"))
+
+    def test_rejects_mismatched_mime_and_partial_configuration(self):
+        CONFIG["generated_image_store_dir"] = self.directory.name
+        CONFIG["generated_image_base_url"] = "https://example.test/generated-images"
+        with self.assertRaisesRegex(ValueError, "MIME"):
+            store_generated_image(b"\x89PNG\r\n\x1a\n", "image/jpeg")
+
+        CONFIG["generated_image_base_url"] = None
+        with self.assertRaisesRegex(RuntimeError, "generated_image_base_url"):
+            validate_generated_image_store()
+
+    @mock.patch(
+        "gemini_web2api.generated_image._secure_store_supported",
+        return_value=False,
+    )
+    def test_rejects_unsupported_filesystem_primitives(self, _supported):
+        CONFIG["generated_image_store_dir"] = self.directory.name
+        CONFIG["generated_image_base_url"] = (
+            "https://example.test/generated-images"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "POSIX no-follow"):
+            validate_generated_image_store()
+
+    def test_rejects_malformed_base_urls_and_symlinked_store(self):
+        CONFIG["generated_image_store_dir"] = self.directory.name
+        for base_url in (
+            "http://example.test/generated-images",
+            "https://example.test:invalid/generated-images",
+            "https://example.test/generated images",
+        ):
+            with self.subTest(base_url=base_url):
+                CONFIG["generated_image_base_url"] = base_url
+                with self.assertRaises(RuntimeError):
+                    validate_generated_image_store()
+
+        if hasattr(os, "symlink"):
+            with tempfile.TemporaryDirectory() as parent:
+                target = os.path.join(parent, "target")
+                link = os.path.join(parent, "link")
+                os.mkdir(target, 0o700)
+                os.symlink(target, link)
+                CONFIG["generated_image_store_dir"] = link
+                CONFIG["generated_image_base_url"] = (
+                    "https://example.test/generated-images"
+                )
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    validate_generated_image_store()
 
 
 class FullSizeImageTests(unittest.TestCase):
@@ -532,6 +624,15 @@ class StreamingEndpointTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
+    def request(self, method, path):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path)
+        response = connection.getresponse()
+        body = response.read()
+        headers = dict(response.getheaders())
+        connection.close()
+        return response.status, headers, body
+
     def post_json(self, path, payload):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request(
@@ -560,6 +661,62 @@ class StreamingEndpointTests(unittest.TestCase):
         headers = dict(response.getheaders())
         connection.close()
         return response.status, headers, body
+
+    def test_serves_stored_images_by_unguessable_path_without_api_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            CONFIG["generated_image_store_dir"] = directory
+            CONFIG["generated_image_base_url"] = (
+                "https://example.test/generated-images"
+            )
+            CONFIG["api_keys"] = ["required-for-api-routes"]
+            data = b"\x89PNG\r\n\x1a\n"
+            url = store_generated_image(data, "image/png")
+            filename = url.rsplit("/", 1)[1]
+
+            status, headers, body = self.request(
+                "GET", f"/generated-images/{filename}"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "image/png")
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            self.assertIn("immutable", headers["Cache-Control"])
+            self.assertEqual(body, data)
+
+            status, headers, body = self.request(
+                "HEAD", f"/generated-images/{filename}"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Length"], str(len(data)))
+            self.assertEqual(body, b"")
+
+            status, _, _ = self.request("GET", "/generated-images/../cookie.txt")
+            self.assertEqual(status, 404)
+
+            missing_name = f"{'A' * 43}.png"
+            status, headers, body = self.request(
+                "HEAD", f"/generated-images/{missing_name}"
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(
+                headers["Content-Length"],
+                str(len(json.dumps({"error": "not found"}).encode())),
+            )
+            self.assertEqual(body, b"")
+
+            status, _, body = self.request("HEAD", "/")
+            self.assertEqual(status, 404)
+            self.assertEqual(body, b"")
+
+            if hasattr(os, "O_NOFOLLOW"):
+                target = os.path.join(directory, "target.png")
+                with open(target, "wb") as output:
+                    output.write(data)
+                symlink_name = f"{'B' * 43}.png"
+                os.symlink(target, os.path.join(directory, symlink_name))
+                status, _, _ = self.request(
+                    "GET", f"/generated-images/{symlink_name}"
+                )
+                self.assertEqual(status, 404)
 
     @mock.patch("gemini_web2api.server.generate_stream")
     def test_chat_stream_starts_with_assistant_role(self, generate_stream):
@@ -910,6 +1067,43 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["url"], "https://lh3.googleusercontent.com/rd-gg-dl/a")
         resolve_url.assert_called_once_with(image.url)
+
+    @mock.patch("gemini_web2api.server.resolve_generated_image_url")
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    @mock.patch(
+        "gemini_web2api.server.download_generated_image",
+        return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
+    )
+    def test_image_generation_url_uses_persistent_store_when_configured(
+        self, download, generate_image, _full_size, resolve_url
+    ):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generate_image.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/a")]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            CONFIG["generated_image_store_dir"] = directory
+            CONFIG["generated_image_base_url"] = (
+                "https://example.test/generated-images"
+            )
+            status, _, body = self.post_json(
+                "/v1/images/generations",
+                {"prompt": "a cat", "response_format": "url"},
+            )
+            url = json.loads(body)["data"][0]["url"]
+            filename = url.rsplit("/", 1)[1]
+
+            self.assertEqual(status, 200)
+            self.assertTrue(url.startswith(
+                "https://example.test/generated-images/"
+            ))
+            self.assertTrue(os.path.isfile(os.path.join(directory, filename)))
+            download.assert_called_once_with(
+                "https://lh3.googleusercontent.com/a"
+            )
+            resolve_url.assert_not_called()
 
     def test_image_generation_endpoint_rejects_unsupported_options(self):
         status, _, _ = self.post_json("/v1/images/generations", {"prompt": "a cat", "n": 2})

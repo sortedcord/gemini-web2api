@@ -1,8 +1,15 @@
 """Parsing and bounded download helpers for Gemini-generated images."""
 from __future__ import annotations
 
+import errno
 import ipaddress
 import json
+import os
+import re
+import secrets
+import stat
+import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -26,6 +33,18 @@ _REDIRECT_STATUS = {301, 302, 303, 307, 308}
 _MAGIC_MIMES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
+)
+_STORED_IMAGE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
+_STORED_IMAGE_MIMES = {
+    extension: mime for mime, extension in _STORED_IMAGE_EXTENSIONS.items()
+}
+_STORED_IMAGE_NAME = re.compile(r"^[A-Za-z0-9_-]{43}\.(?:png|jpg|webp)$")
+_STORED_IMAGE_TEMP = re.compile(
+    r"^\.[A-Za-z0-9_-]{43}\.(?:png|jpg|webp)\.\d+\.tmp$"
 )
 
 
@@ -181,6 +200,175 @@ def _image_mime(data: bytes) -> str:
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
     raise ValueError("generated image has unsupported or invalid bytes")
+
+
+def _persistent_store_config():
+    directory = CONFIG.get("generated_image_store_dir")
+    base_url = CONFIG.get("generated_image_base_url")
+    if not directory and not base_url:
+        return None
+    if not isinstance(directory, str) or not directory:
+        raise RuntimeError("generated_image_store_dir must be configured with generated_image_base_url")
+    if not isinstance(base_url, str) or not base_url:
+        raise RuntimeError("generated_image_base_url must be configured with generated_image_store_dir")
+    if any(character.isspace() or unicodedata.category(character).startswith("C")
+           for character in base_url):
+        raise RuntimeError("generated_image_base_url contains invalid whitespace or controls")
+    parsed = urlsplit(base_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("generated_image_base_url has an invalid port") from exc
+    if (parsed.scheme != "https" or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or port not in (None, 443) or parsed.query or parsed.fragment):
+        raise RuntimeError("generated_image_base_url must be an HTTPS URL without credentials or query")
+    return os.path.abspath(directory), base_url.rstrip("/")
+
+
+def _secure_store_supported() -> bool:
+    required = (
+        os.name == "posix",
+        hasattr(os, "O_DIRECTORY"),
+        hasattr(os, "O_NOFOLLOW"),
+        os.open in os.supports_dir_fd,
+        os.rename in os.supports_dir_fd,
+        os.stat in os.supports_dir_fd,
+        os.unlink in os.supports_dir_fd,
+    )
+    return all(required)
+
+
+def _open_store_directory(directory: str, cleanup: bool = False) -> int:
+    """Open and validate a trusted directory descriptor for relative operations."""
+    if not _secure_store_supported():
+        raise RuntimeError(
+            "persistent generated images require POSIX no-follow directory operations"
+        )
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    before = os.lstat(directory)
+    if not stat.S_ISDIR(before.st_mode) or os.path.realpath(directory) != directory:
+        raise RuntimeError("generated image store must be a real directory, not a symlink")
+
+    descriptor = os.open(
+        directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if ((metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISDIR(metadata.st_mode)):
+            raise RuntimeError("generated image store changed during validation")
+        if metadata.st_uid != os.geteuid():
+            raise RuntimeError("generated image store must be owned by the service user")
+        os.fchmod(descriptor, 0o700)
+        if os.fstat(descriptor).st_mode & 0o077:
+            raise RuntimeError("generated image store must not allow group or other access")
+
+        if cleanup:
+            cutoff = time.time() - 86400
+            for name in os.listdir(descriptor):
+                if not _STORED_IMAGE_TEMP.fullmatch(name):
+                    continue
+                try:
+                    temporary = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    if temporary.st_mtime < cutoff:
+                        os.unlink(name, dir_fd=descriptor)
+                except FileNotFoundError:
+                    pass
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def validate_generated_image_store() -> bool:
+    """Validate persistent-store configuration and initialize it when enabled."""
+    config = _persistent_store_config()
+    if config is None:
+        return False
+    descriptor = _open_store_directory(config[0], cleanup=True)
+    os.close(descriptor)
+    return True
+
+
+def generated_image_store_enabled() -> bool:
+    """Return whether persistent image storage is configured and valid."""
+    return validate_generated_image_store()
+
+
+def store_generated_image(data: bytes, mime: str) -> str | None:
+    """Persist validated image bytes and return a stable public URL when enabled."""
+    config = _persistent_store_config()
+    if config is None:
+        return None
+    directory, base_url = config
+    detected_mime = _image_mime(data)
+    if detected_mime != mime or mime not in _STORED_IMAGE_EXTENSIONS:
+        raise ValueError("generated image MIME does not match bytes")
+
+    filename = f"{secrets.token_urlsafe(32)}{_STORED_IMAGE_EXTENSIONS[mime]}"
+    temporary_name = f".{filename}.{os.getpid()}.tmp"
+    directory_descriptor = _open_store_directory(directory, cleanup=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            temporary_name, flags, 0o600, dir_fd=directory_descriptor
+        )
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.rename(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            pass
+        os.close(directory_descriptor)
+    return f"{base_url}/{filename}"
+
+
+def open_stored_generated_image(filename: str):
+    """Open an allowlisted regular image relative to a trusted store descriptor."""
+    if not isinstance(filename, str) or not _STORED_IMAGE_NAME.fullmatch(filename):
+        return None
+    directory = CONFIG.get("generated_image_store_dir")
+    if not isinstance(directory, str) or not directory:
+        return None
+    mime = _STORED_IMAGE_MIMES.get(os.path.splitext(filename)[1])
+    if not mime:
+        return None
+
+    directory_descriptor = _open_store_directory(
+        os.path.abspath(directory), cleanup=False
+    )
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
+    except OSError:
+        os.close(directory_descriptor)
+        return None
+    os.close(directory_descriptor)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        return None
+    return descriptor, mime, metadata.st_size
 
 
 def _limits() -> tuple[int, int]:
