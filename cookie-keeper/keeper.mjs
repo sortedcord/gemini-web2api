@@ -65,22 +65,15 @@ async function refresh() {
   });
   if (settleMs) await page.waitForTimeout(settleMs);
 
-  // Match OmniRoute's account-neutral browser flow. Google may renumber /u/N
-  // slots in a fresh profile, so URL equality is not an authentication signal.
-  // Do not persist anything unless the authenticated Gemini composer exists.
-  const composer = await page.$(".ql-editor, [contenteditable='true']");
-  if (!composer) {
-    log("authentication expired; Gemini composer was not available");
-    return;
-  }
-
+  // Match OmniRoute's account-neutral flow: read the live browser jar after
+  // Gemini has loaded and persist only the rotatable auth-cookie family.
   const merged = mergeRotatedCookies(loadedCookie, await context.cookies());
   if (merged !== loadedCookie) {
     await atomicWriteCookie(cookieFile, merged);
     loadedCookie = merged;
     log("persisted rotated Gemini session cookies");
   } else {
-    log("session healthy; no cookie rotation observed");
+    log("browser refresh completed; no cookie rotation observed");
   }
 }
 
