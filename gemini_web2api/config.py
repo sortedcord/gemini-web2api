@@ -20,6 +20,9 @@ DEFAULT_CONFIG = {
     # Generated image output only; values above the hard safety caps are ignored.
     "generated_image_max_bytes": 10 * 1024 * 1024,
     "generated_image_max_redirects": 3,
+    # Set both values to replace temporary Google URLs with durable local URLs.
+    "generated_image_store_dir": None,
+    "generated_image_base_url": None,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

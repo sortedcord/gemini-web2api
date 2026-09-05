@@ -6,4 +6,5 @@ __pycache__
 config.json
 cookie.txt
 cookie.json
+generated-images/
 .env

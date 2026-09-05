@@ -26,7 +26,7 @@
 
 ```bash
 pip install -r requirements.txt
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 服务启动在 `http://localhost:8081/v1`.
@@ -108,7 +108,7 @@ gemini
 匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### 如何获取 Cookie
@@ -212,7 +212,7 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 **方式 1: 命令行参数**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **方式 2: config.json**
@@ -223,7 +223,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **方式 3: 环境变量** (自动检测)
 ```bash
 set HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
@@ -262,6 +262,37 @@ resp = client.chat.completions.create(
 Chat Completions 会识别最新用户消息中类似 `generate an image of ...` 的明确图片生成请求，
 并使用同一图片生成路径。流式客户端即使携带函数工具或在对话历史中保留旧图片附件，也会
 收到浏览器可访问的 Markdown 图片 URL。历史附件不会被当作图片编辑输入。
+
+### 持久化生成图片
+
+Google 图片 URL 是临时的。若要让图片链接在聊天重新加载后仍可使用，请同时配置：
+
+```json
+{
+  "generated_image_store_dir": "/generated-images",
+  "generated_image_base_url": "https://api.example.com/generated-images"
+}
+```
+
+请将 `generated_image_store_dir` 挂载到持久化存储。目录必须由服务用户拥有且不可被其他用户
+访问。持久化存储要求 POSIX 描述符相对路径及禁止跟随符号链接的文件系统操作，不支持的平台
+会拒绝启用。服务会强制设置目录权限为 `0700`。启用后，URL 响应会先下载并验证图片，
+再以 `0600` 权限原子写入随机 256 位文件名。服务通过
+`GET /generated-images/<token>.<ext>` 提供带不可变缓存头的图片。浏览器图片请求无法携带
+API 请求头，因此该图片路径不要求 API 密钥，而是依赖不可猜测 URL 控制访问。反向代理应
+只转发 `/generated-images/`，且不得启用目录列表。
+
+Compose 挂载示例：
+
+```yaml
+services:
+  gemini-web2api:
+    volumes:
+      - ./generated-images:/generated-images
+```
+
+两个配置都缺失时，URL 响应仍使用 Gemini 临时图片 URL。只配置其中一个属于无效配置，
+服务将拒绝启动。
 
 base64 输出仅使用 Chrome 模拟下载 HTTPS 的精确或子域
 `googleusercontent.com` 地址：最多 3 次重定向、10 MiB，且 PNG/JPEG/WebP 文件头必须

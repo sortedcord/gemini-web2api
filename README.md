@@ -26,7 +26,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 
 ```bash
 pip install -r requirements.txt
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Server starts at `http://localhost:8081/v1`.
@@ -120,7 +120,7 @@ payload slot 17, for example `{"reasoning":{"think":7}}`. The legacy
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### How to get cookies
@@ -224,7 +224,7 @@ If you cannot access `gemini.google.com` directly (connection timeout), configur
 
 **Method 1: CLI argument**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **Method 2: config.json**
@@ -235,7 +235,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **Method 3: Environment variable** (auto-detected)
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
@@ -295,6 +295,41 @@ Chat Completions routes explicit requests such as `generate an image of ...` in 
 user turn through the same image-generation path. It returns a browser-accessible Markdown
 image URL, including for streaming clients that send function tools or retain older image
 attachments in conversation history. Historical attachments are not treated as image edits.
+
+### Persistent generated images
+
+Google image URLs are temporary. To make image links survive chat reloads, configure both
+persistent-image options:
+
+```json
+{
+  "generated_image_store_dir": "/generated-images",
+  "generated_image_base_url": "https://api.example.com/generated-images"
+}
+```
+
+Mount `generated_image_store_dir` on persistent storage. The directory must be owned by
+the service user and private. Persistent storage requires POSIX descriptor-relative,
+no-follow filesystem operations and fails closed on unsupported platforms. The service
+enforces directory mode `0700`. When enabled, URL responses are downloaded, validated,
+written atomically with mode `0600`, and returned under an
+unguessable 256-bit filename. The server exposes these files at
+`GET /generated-images/<token>.<ext>` with immutable cache headers. The image route does
+not require an API key because browser image requests cannot attach the API header; access
+is controlled by the unguessable URL. Route only `/generated-images/` through your reverse
+proxy and do not expose directory listings.
+
+Example Compose volume:
+
+```yaml
+services:
+  gemini-web2api:
+    volumes:
+      - ./generated-images:/generated-images
+```
+
+When both options are absent, URL responses keep using Gemini's temporary image URL.
+Configuring exactly one option is invalid and prevents the service from starting.
 
 For base64 output, the server downloads only HTTPS exact/subdomain
 `googleusercontent.com` URLs with Chrome impersonation, at most three redirects and 10 MiB.

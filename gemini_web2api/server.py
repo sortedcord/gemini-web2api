@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import itertools
 import json
+import os
 import re
 import time
 import uuid
@@ -19,7 +20,13 @@ from .gemini import (
     get_full_size_image,
     log,
 )
-from .generated_image import download_generated_image, resolve_generated_image_url
+from .generated_image import (
+    download_generated_image,
+    generated_image_store_enabled,
+    open_stored_generated_image,
+    resolve_generated_image_url,
+    store_generated_image,
+)
 from .models import MODELS, resolve_model
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .tools import (
@@ -81,11 +88,14 @@ def _generated_image_output(prompt: str, response_format: str):
     if not result.images:
         raise RuntimeError("Gemini returned no generated image metadata")
     source_url = get_full_size_image(result.images[0]) or result.images[0].url
-    if response_format == "url":
+    if response_format == "url" and not generated_image_store_enabled():
         data = {"url": resolve_generated_image_url(source_url)}
     else:
-        image_bytes, _mime = download_generated_image(source_url)
-        data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+        image_bytes, mime = download_generated_image(source_url)
+        if response_format == "url":
+            data = {"url": store_generated_image(image_bytes, mime)}
+        else:
+            data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
     return result.text, data
 
 
@@ -120,14 +130,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
 
-    def send_json(self, data, status=200):
+    def send_json(self, data, status=200, send_body=True):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if send_body:
+            self.wfile.write(body)
 
     def _start_sse(self):
         self.send_response(200)
@@ -194,8 +205,51 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
 
+    def _stored_image_not_found(self, send_body: bool):
+        self.send_json({"error": "not found"}, 404, send_body=send_body)
+
+    def _handle_stored_image(self, filename: str, send_body: bool = True):
+        stored = open_stored_generated_image(filename)
+        if not stored:
+            self._stored_image_not_found(send_body)
+            return
+        descriptor, mime, size = stored
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        with os.fdopen(descriptor, "rb") as image:
+            if send_body:
+                while True:
+                    chunk = image.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+
+    def do_HEAD(self):
+        try:
+            path = self.path.split("?", 1)[0]
+            prefix = "/generated-images/"
+            if path.startswith(prefix):
+                self._handle_stored_image(path[len(prefix):], send_body=False)
+            else:
+                self.send_json({"error": "not found"}, 404, send_body=False)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
         try:
+            path = self.path.split("?", 1)[0]
+            image_prefix = "/generated-images/"
+            if path.startswith(image_prefix):
+                self._handle_stored_image(path[len(image_prefix):])
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
