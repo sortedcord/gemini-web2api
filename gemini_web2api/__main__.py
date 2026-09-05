@@ -4,6 +4,7 @@ import os
 
 from . import __version__
 from .config import CONFIG, find_config, load_config
+from .conversation import STORE
 from .gemini import HAS_HTTPX
 from .generated_image import validate_generated_image_store
 from .models import MODELS
@@ -31,6 +32,7 @@ def main():
         CONFIG["proxy"] = args.proxy
 
     validate_generated_image_store()
+    STORE.initialize()
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")

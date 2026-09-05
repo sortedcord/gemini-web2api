@@ -13,10 +13,18 @@ from socketserver import ThreadingMixIn
 
 from . import __version__
 from .config import CONFIG
+from .conversation import (
+    STORE,
+    ConversationResolution,
+    namespace_from_request,
+    resolve_conversation,
+    transcript_hash,
+)
 from .gemini import (
     generate,
     generate_image_structured,
     generate_stream,
+    generate_turn,
     get_full_size_image,
     log,
 )
@@ -99,6 +107,56 @@ def _generated_image_output(prompt: str, response_format: str):
     return result.text, data
 
 
+def _messages_with_assistant(messages: list, text: str, tool_calls=None) -> list:
+    assistant = {"role": "assistant", "content": text or ""}
+    if tool_calls:
+        assistant["tool_calls"] = tool_calls
+    return list(messages) + [assistant]
+
+
+def _stateful_messages(messages: list, resolution: ConversationResolution) -> list:
+    if resolution.continuation and resolution.matched_prefix_length:
+        return messages[resolution.matched_prefix_length:]
+    return messages
+
+
+def _save_conversation_turn(
+    request: dict,
+    messages: list,
+    resolution: ConversationResolution,
+    response_id: str | None,
+    text: str,
+    continuation,
+    tool_calls=None,
+    headers=None,
+):
+    if not STORE.enabled or not continuation:
+        return None
+    namespace = namespace_from_request(request, headers)
+    conversation_id = resolution.conversation_id or STORE.create_conversation(namespace)
+    if namespace is None and resolution.parent_turn:
+        namespace = STORE.namespace_for(conversation_id)
+    digest = None
+    # A complete message list can be reconciled after a Chat Completions turn.
+    # For an incremental explicit-ID request, the parent remains authoritative.
+    if resolution.matched_prefix_length or not resolution.parent_turn:
+        digest = transcript_hash(_messages_with_assistant(messages, text, tool_calls))
+    lock = STORE.lock_for(conversation_id)
+    with lock:
+        return STORE.save_turn(
+            conversation_id,
+            namespace,
+            resolution.parent_turn.id if resolution.parent_turn else None,
+            response_id,
+            digest,
+            continuation,
+        )
+
+
+def _conversation_headers(conversation_id: str | None) -> dict:
+    return {"X-Gemini-Conversation-ID": conversation_id} if conversation_id else {}
+
+
 def _upload_images(images: list) -> list:
     """Upload images and return list of file references. Returns None if no images."""
     if not images:
@@ -130,21 +188,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
 
-    def send_json(self, data, status=200, send_body=True):
+    def send_json(self, data, status=200, send_body=True, extra_headers=None):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         if send_body:
             self.wfile.write(body)
 
-    def _start_sse(self):
+    def _start_sse(self, extra_headers=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
 
     def _parse_body(self, body: bytes) -> dict:
@@ -345,10 +407,30 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
+        messages = req.get("messages", [])
+        if not isinstance(messages, list):
+            self.send_json({"error": {"message": "messages must be a list"}}, 400)
+            return
+        resolution = resolve_conversation(req, messages, self.headers)
+        if resolution.error:
+            # Full-history Chat Completions requests can safely reconstruct a
+            # new root; incremental Responses requests cannot.
+            if len(messages) <= 1 or req.get("previous_response_id"):
+                self.send_json({"error": {"code": "conversation_state_expired", "message": resolution.error}}, 409)
+                return
+            resolution = ConversationResolution(stateful=True)
+        if STORE.enabled and resolution.stateful and not resolution.conversation_id:
+            resolution = ConversationResolution(
+                conversation_id=STORE.create_conversation(
+                    namespace_from_request(req, self.headers)
+                ),
+                stateful=True,
+            )
+        generation_messages = _stateful_messages(messages, resolution)
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
-        image_prompt = _chat_image_prompt(req)
-        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        image_prompt = _chat_image_prompt({"messages": generation_messages, "modalities": req.get("modalities")})
+        prompt, images = messages_to_prompt(generation_messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -376,6 +458,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
+        next_continuation = None
+        if resolution.stateful and not image_prompt and precomputed_text is None:
+            try:
+                precomputed_text, next_continuation = generate_turn(
+                    prompt, model_id, think_mode, file_refs, extra_fields,
+                    resolution.continuation,
+                )
+            except Exception as e:
+                if resolution.continuation and resolution.matched_prefix_length:
+                    try:
+                        fallback_prompt, fallback_images = messages_to_prompt(
+                            messages, tools, tool_choice
+                        )
+                        fallback_refs = _upload_images(fallback_images)
+                        precomputed_text, next_continuation = generate_turn(
+                            fallback_prompt, model_id, think_mode, fallback_refs,
+                            extra_fields, None,
+                        )
+                        prompt, file_refs = fallback_prompt, fallback_refs
+                    except Exception as fallback_error:
+                        self.send_json({"error": {"message": f"upstream error: {fallback_error}"}}, 502)
+                        return
+                else:
+                    self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                    return
+
         if stream and (not tools or tool_choice == "none"):
             # Prime the iterator before committing HTTP 200/SSE headers so an
             # immediate upstream rejection remains a normal JSON 502.
@@ -395,12 +503,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
                 return
             try:
-                self._start_sse()
+                self._start_sse(_conversation_headers(resolution.conversation_id))
                 first_chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model_name,
+                    "conversation_id": resolution.conversation_id,
                     "choices": [{
                         "index": 0,
                         "delta": {"role": "assistant"},
@@ -435,6 +544,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+            if next_continuation:
+                _save_conversation_turn(
+                    req, messages, resolution, cid, precomputed_text or "",
+                    next_continuation, headers=self.headers,
+                )
             return
 
         try:
@@ -451,9 +565,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if tool_calls:
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
+        if next_continuation:
+            _save_conversation_turn(
+                req, messages, resolution, cid, text, next_continuation,
+                tool_calls, headers=self.headers,
+            )
 
         if stream:
-            self._start_sse()
+            self._start_sse(_conversation_headers(resolution.conversation_id))
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -466,7 +585,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
                           "total_tokens": (len(prompt)+len(text or ""))//4},
-            })
+                "conversation_id": resolution.conversation_id,
+            }, extra_headers=_conversation_headers(resolution.conversation_id))
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
@@ -534,6 +654,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
+        resolution = resolve_conversation(req, messages, self.headers)
+        if resolution.error:
+            if len(messages) <= 1:
+                self.send_json({"error": {"code": "conversation_state_expired", "message": resolution.error}}, 409)
+                return
+            resolution = ConversationResolution(stateful=True)
+        if STORE.enabled and resolution.stateful and not resolution.conversation_id:
+            resolution = ConversationResolution(
+                conversation_id=STORE.create_conversation(
+                    namespace_from_request(req, self.headers)
+                ),
+                parent_turn=resolution.parent_turn,
+                continuation=resolution.continuation,
+                matched_prefix_length=resolution.matched_prefix_length,
+                stateful=True,
+            )
+        messages = _stateful_messages(messages, resolution)
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
         if not prompt.strip():
@@ -547,6 +684,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         generated_image_call = None
+        next_continuation = None
+        rid = f"resp_{uuid.uuid4().hex[:16]}"
         try:
             file_refs = _upload_images(images)
             if image_generation_requested:
@@ -558,7 +697,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "result": image_data["b64_json"],
                 }
             else:
-                text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                if resolution.stateful:
+                    text, next_continuation = generate_turn(
+                        prompt, model_id, think_mode, file_refs, extra_fields,
+                        resolution.continuation,
+                    )
+                else:
+                    text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -567,7 +712,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
 
-        rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
         output = []
         if tool_calls:
@@ -580,8 +724,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if generated_image_call:
             output.append(generated_image_call)
 
+        if next_continuation:
+            _save_conversation_turn(
+                req, messages, resolution, rid, text, next_continuation,
+                tool_calls, headers=self.headers,
+            )
+
         if req.get("stream"):
-            self._start_sse()
+            self._start_sse(_conversation_headers(resolution.conversation_id))
             sequence_number = 0
 
             def emit(event_type, **fields):
@@ -606,6 +756,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "object": "response",
                 "created_at": int(time.time()),
                 "model": model_name,
+                "conversation_id": resolution.conversation_id,
             }
             emit(
                 "response.created",
@@ -730,7 +881,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+                            "conversation_id": resolution.conversation_id,
+                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}},
+                           extra_headers=_conversation_headers(resolution.conversation_id))
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 

@@ -115,6 +115,39 @@ payload slot 17, for example `{"reasoning":{"think":7}}`. The legacy
 `@think=N` model suffix remains supported and takes precedence over
 `reasoning.think`.
 
+## Native Multi-Turn Conversations
+
+The bridge can preserve Gemini Web's native conversation state instead of
+re-sending the complete transcript on every request. Enable it with:
+
+```json
+{
+  "conversation_state_enabled": true,
+  "conversation_store_path": "/data/conversations.db",
+  "conversation_ttl_sec": 604800
+}
+```
+
+The Responses API uses the standard `previous_response_id`. Chat Completions
+can use `metadata.conversation_id` and `metadata.chat_id`; the bridge also
+reconciles exact message-history prefixes inside a trusted namespace. A new
+conversation can be forced with `metadata.new_conversation: true` or the
+`X-Gemini-New-Chat: true` header.
+
+When state is enabled, successful responses include a `conversation_id` field
+and `X-Gemini-Conversation-ID` header. Conversation IDs and continuation state
+are stored in a private SQLite database with a configurable TTL. No source-IP
+or fuzzy semantic matching is used. Requests without a safe namespace fall
+back to a new conversation, preserving compatibility with stateless clients.
+
+Mount the parent directory as persistent storage when state must survive
+container restarts:
+
+```yaml
+volumes:
+  - ./conversation-data:/data
+```
+
 ## Optional: Cookie for Pro
 
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
@@ -184,7 +217,11 @@ Create `config.json` in the same directory:
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "conversation_state_enabled": true,
+  "conversation_store_path": "/data/conversations.db",
+  "conversation_ttl_sec": 604800,
+  "conversation_account_id": "default"
 }
 ```
 
@@ -343,7 +380,7 @@ the hard 10 MiB / three-redirect caps.
 - **Image requests require `curl_cffi` and may require cookies**: Multimodal input and generated-image output use Chrome-impersonated requests. If upload or generation fails, configure a Gemini cookie. Image input streaming returns one complete result rather than incremental text.
 - **Generated image protocol can change**: Image output uses Gemini's undocumented GUI payload and full-size RPC. The server falls back to the validated preview when full-size RPC resolution is unavailable; edits, caching, and proxying are not implemented.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
+- **Native conversation state is opt-in**: Enable `conversation_state_enabled` and mount `/data` to use Gemini-native multi-turn continuation. Without it, each request remains stateless and supplied history is flattened into the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 
 ## Requirements

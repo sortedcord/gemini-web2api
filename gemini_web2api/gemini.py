@@ -26,6 +26,7 @@ except ImportError:
     HAS_CURL_CFFI = False
 
 from .config import CONFIG
+from .conversation import GeminiContinuation
 from .generated_image import GenerationResult, extract_generation_result
 
 _ssl_ctx = None
@@ -184,7 +185,8 @@ def _normalise_file_ref(file_ref) -> list:
 
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
                    extra_fields: dict = None, xsrf_token: str = None,
-                   request_uuid: str = None) -> str:
+                   request_uuid: str = None,
+                   continuation: GeminiContinuation = None) -> str:
     # File-bearing requests use the current 81-slot Gemini Web protocol and
     # require slot 80. Preserve the established text-only payload unchanged.
     # Callers may still pass old plain string refs.
@@ -195,7 +197,8 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
-    inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    inner[2] = (continuation.payload_slot() if continuation else
+                ["", "", "", None, None, None, None, None, None, ""])
     inner[6] = [0]
     inner[7] = 1
     inner[10] = 1
@@ -310,6 +313,52 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+def _response_frames(raw: str):
+    """Yield decoded Gemini response payloads from wrb.fr lines."""
+    for line in raw.splitlines():
+        if '"wrb.fr"' not in line:
+            continue
+        try:
+            envelope = json.loads(line)
+            payload = envelope[0][2]
+            if isinstance(payload, str):
+                yield json.loads(payload)
+        except (json.JSONDecodeError, TypeError, IndexError):
+            continue
+
+
+def extract_continuation(raw: str) -> GeminiContinuation | None:
+    """Extract the final native continuation state from Gemini response frames."""
+    cid = rid = rcid = context_token = None
+    for frame in _response_frames(raw):
+        metadata = frame[1] if isinstance(frame, list) and len(frame) > 1 else None
+        if isinstance(metadata, list):
+            if len(metadata) > 0 and isinstance(metadata[0], str) and metadata[0]:
+                cid = metadata[0]
+            if len(metadata) > 1 and isinstance(metadata[1], str) and metadata[1]:
+                rid = metadata[1]
+        fields = frame[2] if isinstance(frame, list) and len(frame) > 2 else None
+        if isinstance(fields, dict):
+            value = fields.get("26")
+            if isinstance(value, str) and value:
+                context_token = value
+        candidates = frame[4] if isinstance(frame, list) and len(frame) > 4 else None
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                value = candidate[0] if isinstance(candidate, list) and candidate else None
+                if isinstance(value, str) and value:
+                    rcid = value
+    if all(isinstance(value, str) and value for value in
+           (cid, rid, rcid, context_token)):
+        return GeminiContinuation(cid, rid, rcid, context_token)
+    return None
+
+
+def extract_turn_result(raw: str) -> tuple[str, GeminiContinuation | None]:
+    """Return parsed text and native continuation state from a completed response."""
+    return extract_response_text(raw), extract_continuation(raw)
+
+
 def _bard_error_code(raw: str) -> int | None:
     """Return a BardErrorInfo code from legacy text or structured wrb.fr frames."""
     legacy = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
@@ -392,7 +441,8 @@ def _curl_post_with_retry(url: str, request_args: dict, operation: str) -> str:
 
 
 def _generate_file_raw_with_curl(prompt: str, model_id: int, think_mode: int, file_refs: list,
-                                 extra_fields: dict = None) -> str:
+                                 extra_fields: dict = None,
+                                 continuation: GeminiContinuation = None) -> str:
     """Send a file request with Chrome TLS/browser impersonation and return raw frames.
 
     Gemini currently rejects otherwise valid uploaded-file requests from the
@@ -409,6 +459,7 @@ def _generate_file_raw_with_curl(prompt: str, model_id: int, think_mode: int, fi
     body = _build_payload(
         prompt, model_id, think_mode, file_refs, extra_fields,
         xsrf_token=page_tokens.get("at"), request_uuid=request_uuid,
+        continuation=continuation,
     )
     url = _get_url(page_tokens.get("f_sid"))
     headers = _build_headers(request_uuid)
@@ -457,7 +508,9 @@ def generate_image_structured(prompt: str) -> GenerationResult:
     bard_error_code = _bard_error_code(raw)
     if bard_error_code is not None:
         raise _upstream_error(bard_error_code)
-    return extract_generation_result(raw, clean_text)
+    result = extract_generation_result(raw, clean_text)
+    result.continuation = extract_continuation(raw)
+    return result
 
 
 def _batch_response_url(raw: str) -> str:
@@ -559,16 +612,20 @@ def _text_page_tokens() -> dict:
 
 
 def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
-                  extra_fields: dict = None) -> str:
+                  extra_fields: dict = None,
+                  continuation: GeminiContinuation = None) -> str:
     """Generate once and retain the raw frames for structured rich-content parsing."""
     if file_refs:
-        return _generate_file_raw_with_curl(prompt, model_id, think_mode, file_refs, extra_fields)
+        return _generate_file_raw_with_curl(
+            prompt, model_id, think_mode, file_refs, extra_fields, continuation
+        )
 
     page_tokens = _text_page_tokens()
     request_uuid = str(uuid.uuid4()).upper()
     body = _build_payload(
         prompt, model_id, think_mode, extra_fields=extra_fields,
         xsrf_token=page_tokens.get("at"), request_uuid=request_uuid,
+        continuation=continuation,
     ).encode()
     url = _get_url(page_tokens.get("f_sid"))
     headers = _build_headers(request_uuid)
@@ -595,9 +652,23 @@ def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list =
     raise last_err
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+             extra_fields: dict = None,
+             continuation: GeminiContinuation = None) -> str:
     """Non-streaming generation with retry."""
-    return extract_response_text(_generate_raw(prompt, model_id, think_mode, file_refs, extra_fields))
+    return extract_response_text(_generate_raw(
+        prompt, model_id, think_mode, file_refs, extra_fields, continuation
+    ))
+
+
+def generate_turn(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                  extra_fields: dict = None,
+                  continuation: GeminiContinuation = None):
+    """Generate a complete turn and retain native continuation metadata."""
+    raw = _generate_raw(
+        prompt, model_id, think_mode, file_refs, extra_fields, continuation
+    )
+    return extract_turn_result(raw)
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):

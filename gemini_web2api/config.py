@@ -17,6 +17,13 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    # Native Gemini continuation state. Disable to retain fully stateless behavior.
+    "conversation_state_enabled": False,
+    "conversation_store_path": "/data/conversations.db",
+    "conversation_ttl_sec": 604800,
+    "conversation_max_conversations": 10000,
+    "conversation_max_turns_per_conversation": 200,
+    "conversation_account_id": "default",
     # Generated image output only; values above the hard safety caps are ignored.
     "generated_image_max_bytes": 10 * 1024 * 1024,
     "generated_image_max_redirects": 3,

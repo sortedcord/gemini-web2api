@@ -103,6 +103,36 @@ gemini
 `{"reasoning":{"think":7}}`。旧的 `@think=N` 模型名后缀仍受支持，并优先于
 `reasoning.think`。
 
+## 原生多轮对话
+
+桥接器可以保存 Gemini Web 的原生对话状态，而不是每次请求都重新发送完整历史。
+在配置中启用:
+
+```json
+{
+  "conversation_state_enabled": true,
+  "conversation_store_path": "/data/conversations.db",
+  "conversation_ttl_sec": 604800
+}
+```
+
+Responses API 使用标准的 `previous_response_id`。Chat Completions 可以使用
+`metadata.conversation_id` 和 `metadata.chat_id`; 桥接器也会在可信命名空间内匹配
+完全一致的消息历史前缀。可通过 `metadata.new_conversation: true` 或
+`X-Gemini-New-Chat: true` 强制开始新对话。
+
+启用状态后，成功响应会包含 `conversation_id` 字段和
+`X-Gemini-Conversation-ID` 响应头。对话 ID 和继续状态会存储在带 TTL 的私有 SQLite
+数据库中。不使用来源 IP 或模糊语义匹配。没有安全命名空间的请求会回退到新对话，
+保持无状态客户端的兼容性。
+
+如需在容器重启后保留状态，请将父目录挂载为持久化存储:
+
+```yaml
+volumes:
+  - ./conversation-data:/data
+```
+
 ## 可选: Cookie 配置 (Pro 模型)
 
 匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
@@ -172,7 +202,11 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "conversation_state_enabled": true,
+  "conversation_store_path": "/data/conversations.db",
+  "conversation_ttl_sec": 604800,
+  "conversation_account_id": "default"
 }
 ```
 
@@ -305,7 +339,7 @@ base64 输出仅使用 Chrome 模拟下载 HTTPS 的精确或子域
 - **图片请求需要 `curl_cffi`，且可能需要 Cookie**: 多模态输入与图片生成输出使用 Chrome 模拟请求。上传或生成失败时，请配置 Gemini cookie。图片输入的流式请求会返回一个完整结果，而非增量文本。
 - **图片生成协议可能变化**: 图片输出依赖 Gemini 未公开的 GUI 请求体和全尺寸 RPC。全尺寸 RPC 不可用时会回退到已验证预览图；未实现图片编辑、缓存或代理。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
-- **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
+- **原生对话状态可选**: 启用 `conversation_state_enabled` 并挂载 `/data` 后使用 Gemini 原生多轮继续。未启用时每个请求仍然无状态，提供的历史会被合并到 prompt 中。
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
 
 ## 系统要求

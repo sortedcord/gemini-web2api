@@ -4,6 +4,7 @@ config.json
 cookie.txt
 cookie.json
 generated-images/
+conversation-data/
 .env
 .idea
 .DS_Store

@@ -67,6 +67,7 @@ class GenerationResult:
     text: str = ""
     images: list[GeneratedImage] = field(default_factory=list)
     raw: str = ""
+    continuation: Any = None
 
 
 def _nested(value: Any, indexes: list[int], default: Any = None) -> Any:

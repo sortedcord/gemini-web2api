@@ -9,6 +9,13 @@ from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
+from gemini_web2api.conversation import (
+    STORE,
+    ConversationStore,
+    GeminiContinuation,
+    namespace_from_request,
+    transcript_hash,
+)
 from gemini_web2api.gemini import (
     GeminiUpstreamError,
     _batch_response_url,
@@ -17,6 +24,7 @@ from gemini_web2api.gemini import (
     _build_payload,
     _generate_file_with_curl,
     _generate_raw,
+    extract_continuation,
     extract_response_text,
     generate_image_structured,
     generate_stream,
@@ -99,6 +107,13 @@ class PayloadPersistenceTests(unittest.TestCase):
 
         self.assertEqual(inner[0][3], [[["/uploaded/image-ref"], "image.png"]])
 
+    def test_continuation_payload_slot_is_native_shape(self):
+        continuation = GeminiContinuation("c_id", "r_id", "rc_id", "context")
+        inner = _decode_payload(_build_payload(
+            "hello", 1, 4, continuation=continuation
+        ))
+        self.assertEqual(inner[2], continuation.payload_slot())
+
     def test_text_payload_shape_is_unchanged(self):
         inner = _decode_payload(_build_payload("hello", 1, 4))
 
@@ -141,6 +156,21 @@ class UpstreamErrorTests(unittest.TestCase):
                 [1100],
             ]]],
         ]]
+
+    def test_extract_continuation_from_structured_frames(self):
+        payload = [
+            None,
+            ["c_id", "r_id"],
+            {"26": "context"},
+            None,
+            [["rc_id", ["hello"]]],
+        ]
+        frame = [["wrb.fr", None, json.dumps(payload)]]
+        continuation = extract_continuation(json.dumps(frame))
+        self.assertEqual(
+            continuation,
+            GeminiContinuation("c_id", "r_id", "rc_id", "context"),
+        )
 
     def test_extract_response_text_rejects_structured_bard_error(self):
         with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[1100\]"):
@@ -223,6 +253,60 @@ class ModelResolutionTests(unittest.TestCase):
         self.assertIn("reasoning think", resolve_model(
             "gemini-3.6-flash", {"think": True}
         )[3])
+
+
+class ConversationStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        self.directory = tempfile.TemporaryDirectory()
+        CONFIG["conversation_state_enabled"] = True
+        CONFIG["conversation_store_path"] = os.path.join(
+            self.directory.name, "conversations.db"
+        )
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+        self.directory.cleanup()
+
+    def test_turn_tree_and_response_lookup(self):
+        store = ConversationStore(CONFIG["conversation_store_path"])
+        namespace = namespace_from_request({"metadata": {"chat_id": "chat-a"}})
+        conversation_id = store.create_conversation(namespace)
+        first = GeminiContinuation("c1", "r1", "rc1", "ctx1")
+        first_turn = store.save_turn(
+            conversation_id, namespace, None, "resp-1",
+            transcript_hash([{"role": "user", "content": "one"},
+                             {"role": "assistant", "content": "two"}]),
+            first,
+        )
+        self.assertEqual(store.get_by_response("resp-1"), first_turn)
+        second = GeminiContinuation("c2", "r2", "rc2", "ctx2")
+        second_turn = store.save_turn(
+            conversation_id, namespace, first_turn.id, "resp-2",
+            transcript_hash([{"role": "user", "content": "one"},
+                             {"role": "assistant", "content": "two"},
+                             {"role": "user", "content": "three"},
+                             {"role": "assistant", "content": "four"}]),
+            second,
+        )
+        self.assertEqual(store.get_current(conversation_id, namespace), second_turn)
+        self.assertEqual(
+            store.find_by_hash(namespace, second_turn.transcript_hash), second_turn
+        )
+
+    def test_namespaces_do_not_cross(self):
+        store = ConversationStore(CONFIG["conversation_store_path"])
+        first_namespace = namespace_from_request({"user": "one"})
+        second_namespace = namespace_from_request({"user": "two"})
+        conversation_id = store.create_conversation(first_namespace)
+        turn = store.save_turn(
+            conversation_id, first_namespace, None, "resp-namespace", "digest",
+            GeminiContinuation("c", "r", "rc", "ctx"),
+        )
+        self.assertIsNone(store.find_by_hash(second_namespace, "digest"))
+        self.assertIsNone(store.get_current(conversation_id, second_namespace))
+        self.assertEqual(store.get_by_response("resp-namespace"), turn)
 
 
 class GeneratedImageTests(unittest.TestCase):
@@ -914,6 +998,103 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"type": "upstream_error"', body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate_turn")
+    def test_chat_completions_reconciles_history_and_continues_natively(self, generate_turn):
+        original_path = STORE._path
+        original_initialized = STORE._initialized
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                STORE._path = os.path.join(directory, "conversations.db")
+                STORE._initialized = False
+                CONFIG["conversation_state_enabled"] = True
+                first_continuation = GeminiContinuation("c1", "r1", "rc1", "ctx1")
+                second_continuation = GeminiContinuation("c2", "r2", "rc2", "ctx2")
+                generate_turn.side_effect = [
+                    ("remembered", first_continuation),
+                    ("violet", second_continuation),
+                ]
+                first_status, first_headers, first_body = self.post_json(
+                    "/v1/chat/completions",
+                    {
+                        "model": "gemini-3.6-flash",
+                        "metadata": {"chat_id": "webui-chat-1"},
+                        "messages": [{"role": "user", "content": "Remember violet"}],
+                    },
+                )
+                first_response = json.loads(first_body)
+                conversation_id = first_response["conversation_id"]
+                self.assertEqual(first_status, 200)
+                self.assertEqual(first_headers["X-Gemini-Conversation-ID"], conversation_id)
+
+                second_status, _, second_body = self.post_json(
+                    "/v1/chat/completions",
+                    {
+                        "model": "gemini-3.6-flash",
+                        "metadata": {
+                            "chat_id": "webui-chat-1",
+                            "conversation_id": conversation_id,
+                        },
+                        "messages": [
+                            {"role": "user", "content": "Remember violet"},
+                            {"role": "assistant", "content": "remembered"},
+                            {"role": "user", "content": "What was the color?"},
+                        ],
+                    },
+                )
+                self.assertEqual(second_status, 200)
+                self.assertEqual(
+                    json.loads(second_body)["choices"][0]["message"]["content"],
+                    "violet",
+                )
+                self.assertEqual(generate_turn.call_count, 2)
+                self.assertEqual(generate_turn.call_args_list[1].args[0], "What was the color?")
+                self.assertEqual(generate_turn.call_args_list[1].args[-1], first_continuation)
+        finally:
+            STORE._path = original_path
+            STORE._initialized = original_initialized
+
+    @mock.patch("gemini_web2api.server.generate_turn")
+    def test_responses_previous_response_id_continues_and_branches(self, generate_turn):
+        original_path = STORE._path
+        original_initialized = STORE._initialized
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                STORE._path = os.path.join(directory, "responses.db")
+                STORE._initialized = False
+                CONFIG["conversation_state_enabled"] = True
+                first = GeminiContinuation("c1", "r1", "rc1", "ctx1")
+                second = GeminiContinuation("c2", "r2", "rc2", "ctx2")
+                third = GeminiContinuation("c3", "r3", "rc3", "ctx3")
+                generate_turn.side_effect = [("one", first), ("two", second), ("three", third)]
+                status, _, body = self.post_json(
+                    "/v1/responses", {"input": "Remember one", "user": "responses-user"}
+                )
+                first_response = json.loads(body)
+                self.assertEqual(status, 200)
+                first_id = first_response["id"]
+                conversation_id = first_response["conversation_id"]
+                status, _, body = self.post_json(
+                    "/v1/responses", {
+                        "previous_response_id": first_id,
+                        "input": "Continue one",
+                    }
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["conversation_id"], conversation_id)
+                self.assertEqual(generate_turn.call_args_list[1].args[0], "Continue one")
+                self.assertEqual(generate_turn.call_args_list[1].args[-1], first)
+                status, _, body = self.post_json(
+                    "/v1/responses", {
+                        "previous_response_id": first_id,
+                        "input": "Branch one",
+                    }
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(generate_turn.call_args_list[2].args[-1], first)
+        finally:
+            STORE._path = original_path
+            STORE._initialized = original_initialized
 
     @mock.patch("gemini_web2api.server.generate", return_value="chunked ok")
     def test_chat_accepts_chunked_body(self, _generate):
