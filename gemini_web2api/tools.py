@@ -1,10 +1,10 @@
 """Tool calling and multimodal message parsing."""
-import json
-import re
-import uuid
 import base64
 import binascii
 import io
+import json
+import re
+import uuid
 from urllib.parse import unquote_to_bytes
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
