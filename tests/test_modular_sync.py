@@ -4,7 +4,7 @@ import json
 import threading
 import unittest
 from unittest import mock
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import (
@@ -14,6 +14,7 @@ from gemini_web2api.gemini import (
     _build_model_headers,
     _build_payload,
     _generate_file_with_curl,
+    _generate_raw,
     extract_response_text,
     generate_image_structured,
     generate_stream,
@@ -148,6 +149,25 @@ class UpstreamErrorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, r"BardErrorInfo \[1100\]"):
             generate_image_structured("cat")
+
+    @mock.patch("gemini_web2api.multimodal._cached_page_tokens")
+    @mock.patch("gemini_web2api.gemini.urllib.request.urlopen")
+    def test_text_generation_uses_fresh_page_xsrf_and_session(self, urlopen, tokens):
+        tokens.return_value = {"at": "fresh-xsrf", "f_sid": "fresh-session"}
+        response = mock.MagicMock()
+        response.read.return_value = b""
+        urlopen.return_value = response
+
+        _generate_raw("hello", 1, 4)
+
+        tokens.assert_called_once_with(max_age=0)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(parse_qs(urlparse(request.full_url).query)["f.sid"], ["fresh-session"])
+        self.assertEqual(parse_qs(request.data.decode())["at"], ["fresh-xsrf"])
+        self.assertIn(
+            "x-goog-ext-525005358-jspb",
+            {key.lower() for key in request.headers},
+        )
 
     @mock.patch("gemini_web2api.gemini._get_httpx_client")
     @mock.patch("gemini_web2api.gemini.HAS_HTTPX", True)

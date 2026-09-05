@@ -550,15 +550,28 @@ def _generate_file_with_curl(prompt: str, model_id: int, think_mode: int, file_r
     ))
 
 
+def _text_page_tokens() -> dict:
+    """Fetch current page routing and XSRF tokens for a text generation request."""
+    # Gemini Web now rejects text requests lacking the page's current ``at``
+    # token and frontend session ID, just as it already does file requests.
+    from .multimodal import _cached_page_tokens
+    return _cached_page_tokens(max_age=0)
+
+
 def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
                   extra_fields: dict = None) -> str:
     """Generate once and retain the raw frames for structured rich-content parsing."""
     if file_refs:
         return _generate_file_raw_with_curl(prompt, model_id, think_mode, file_refs, extra_fields)
 
-    body = _build_payload(prompt, model_id, think_mode, extra_fields=extra_fields).encode()
-    url = _get_url()
-    headers = _build_headers()
+    page_tokens = _text_page_tokens()
+    request_uuid = str(uuid.uuid4()).upper()
+    body = _build_payload(
+        prompt, model_id, think_mode, extra_fields=extra_fields,
+        xsrf_token=page_tokens.get("at"), request_uuid=request_uuid,
+    ).encode()
+    url = _get_url(page_tokens.get("f_sid"))
+    headers = _build_headers(request_uuid)
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
     last_err = None
@@ -605,9 +618,14 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers()
+    page_tokens = _text_page_tokens()
+    request_uuid = str(uuid.uuid4()).upper()
+    body = _build_payload(
+        prompt, model_id, think_mode, file_refs, extra_fields,
+        xsrf_token=page_tokens.get("at"), request_uuid=request_uuid,
+    )
+    url = _get_url(page_tokens.get("f_sid"))
+    headers = _build_headers(request_uuid)
     client = _get_httpx_client()
 
     last_err = None
