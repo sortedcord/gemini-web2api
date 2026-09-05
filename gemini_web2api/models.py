@@ -52,19 +52,30 @@ def resolve_model(model_name: str, reasoning=None, default: str = "gemini-3.6-fl
         log(f"Unknown model '{model_name}', falling back to '{default}'")
         model_name = default
         cfg = MODELS[default]
+    reasoning_think = None
     if reasoning is not None:
-        effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-        if effort not in ("none", "low", "medium", "high"):
+        if isinstance(reasoning, dict):
+            effort = reasoning.get("effort")
+            reasoning_think = reasoning.get("think")
+        else:
+            effort = reasoning
+        if effort is not None and effort not in ("none", "low", "medium", "high"):
             return None, None, None, "reasoning effort must be none, low, medium, or high", None
+        if (reasoning_think is not None
+                and (not isinstance(reasoning_think, int) or isinstance(reasoning_think, bool))):
+            return None, None, None, "reasoning think must be an integer", None
         # Gemini Chat's captured mode picker uses 1 for normal and 2 for
         # Extended thinking. Preserve an explicit @think= override for clients
         # that need the protocol-level value at slot 17.
-        reasoning_extra = {80: 1 if effort in ("none", "low") else 2}
+        reasoning_extra = ({80: 1 if effort in ("none", "low") else 2}
+                           if effort is not None else {})
     else:
         reasoning_extra = {}
 
     mode_id = cfg["mode"]
-    think_mode = think_override if think_override is not None else cfg["think"]
+    think_mode = (think_override if think_override is not None
+                  else reasoning_think if reasoning_think is not None
+                  else cfg["think"])
     extra = dict(cfg.get("extra", {}))
     extra.update(reasoning_extra)
     return model_name, mode_id, think_mode, None, extra or None

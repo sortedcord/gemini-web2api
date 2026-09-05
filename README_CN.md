@@ -99,8 +99,9 @@ gemini
 {"model":"gemini-3.6-flash","reasoning":{"effort":"medium"}}
 ```
 
-可在模型名后追加 `@think=N` 设置 Gemini Web 负载第 17 槽的原始 think 值。这个高级
-兼容覆盖会优先于默认 think 值，并可与 `reasoning` 组合使用。
+可通过整数 `reasoning.think` 设置 Gemini Web 负载第 17 槽的原始 think 值，例如
+`{"reasoning":{"think":7}}`。旧的 `@think=N` 模型名后缀仍受支持，并优先于
+`reasoning.think`。
 
 ## 可选: Cookie 配置 (Pro 模型)
 

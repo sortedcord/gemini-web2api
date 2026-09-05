@@ -204,11 +204,18 @@ class ModelResolutionTests(unittest.TestCase):
             resolve_model("gemini-3.6-flash", {"effort": "medium"})[4], {80: 2}
         )
         self.assertEqual(
-            resolve_model("gemini-3.1-pro@think=7", "high")[2:],
+            resolve_model("gemini-3.1-pro", {"effort": "high", "think": 7})[2:],
             (7, None, {80: 2}),
+        )
+        self.assertEqual(
+            resolve_model("gemini-3.1-pro@think=8", {"think": 7})[2:],
+            (8, None, {80: 1}),
         )
         self.assertIn("reasoning effort", resolve_model(
             "gemini-3.6-flash", {"effort": "invalid"}
+        )[3])
+        self.assertIn("reasoning think", resolve_model(
+            "gemini-3.6-flash", {"think": True}
         )[3])
 
 

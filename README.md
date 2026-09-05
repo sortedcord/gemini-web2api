@@ -111,9 +111,10 @@ Use the OpenAI-style `reasoning.effort` request parameter, or the compatible
 {"model":"gemini-3.6-flash","reasoning":{"effort":"medium"}}
 ```
 
-Append `@think=N` to a model name to set the raw Gemini Web think value at
-payload slot 17. This advanced override is retained for compatibility and takes
-precedence over the default think value; it can be combined with `reasoning`.
+Set `reasoning.think` to an integer to set the raw Gemini Web think value at
+payload slot 17, for example `{"reasoning":{"think":7}}`. The legacy
+`@think=N` model suffix remains supported and takes precedence over
+`reasoning.think`.
 
 ## Optional: Cookie for Pro
 
