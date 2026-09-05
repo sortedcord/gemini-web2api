@@ -16,7 +16,7 @@
 - **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python，图片请求使用 `curl_cffi` 提供 Chrome 兼容性
+- **跨平台**: Python 服务，图片请求使用 `curl_cffi` 提供 Chrome 兼容性
 - **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
@@ -79,23 +79,29 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
-| `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
-| `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
-| `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
-| `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
-| `gemini-auto` | 自动选择模型 | 不定 |
-| `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
+| `gemini-3.5-flash-lite` | Gemini Chat Flash-Lite | 不定 |
+| `gemini-3.6-flash` | Gemini Chat Flash | 不定 |
+| `gemini-3.1-pro` | Gemini Chat Pro | 不定 |
 
-### 思考深度
+该列表来自已认证 Gemini Chat 的模式选择器，而非公开 Gemini API 目录。旧模型名仍作为
+别名接受，但不会在模型列表中显示。
 
-在模型名后追加 `@think=N`:
+### 推理
 
+使用 OpenAI 风格的 `reasoning.effort` 参数:
+
+| Effort | Gemini Chat 路由 |
+|--------|-------------------|
+| `none`, `low` | 常规推理 |
+| `medium`, `high` | Extended thinking |
+
+```json
+{"model":"gemini-3.6-flash","reasoning":{"effort":"medium"}}
 ```
-gemini-3.5-flash-thinking@think=0   # 最深 (默认)
-gemini-3.5-flash-thinking@think=2   # 中等
-gemini-3.5-flash-thinking@think=4   # 最浅
-```
+
+可通过整数 `reasoning.think` 设置 Gemini Web 负载第 17 槽的原始 think 值，例如
+`{"reasoning":{"think":7}}`。旧的 `@think=N` 模型名后缀仍受支持，并优先于
+`reasoning.think`。
 
 ## 可选: Cookie 配置 (Pro 模型)
 
@@ -225,7 +231,9 @@ python gemini_web2api.py
 ## 图片输入
 
 Chat Completions 和 Responses API 支持 OpenAI 风格的多模态消息。图片可以使用
-HTTP(S) URL 或 base64 data URL:
+公开 HTTPS URL 或 base64 data URL。远程图片最多 10 MiB、允许 3 次重定向；私有、
+回环、链路本地地址以及非图片响应会被拒绝。为固定已验证的 DNS 地址并保持安全边界，
+远程图片下载使用直连，不经过配置的代理：
 
 ```python
 resp = client.chat.completions.create(
@@ -242,23 +250,28 @@ resp = client.chat.completions.create(
 
 ## 图片输出
 
-`POST /v1/images/generations` 接受文本 `prompt`、可选 `model` 与 `n: 1`，返回一个
-OpenAI 兼容结果。`response_format` 默认是 `b64_json`，优先使用 Gemini 全尺寸 RPC，
+`POST /v1/images/generations` 接受文本 `prompt`、可选 `model` 与 `n: 1`。`model`
+字段仅用于兼容客户端；Gemini Web 会独立选择图片路由，不使用文本模型目录。
+接口返回一个 OpenAI 兼容结果。`response_format` 默认是 `b64_json`，优先使用 Gemini 全尺寸 RPC，
 该 RPC 不可用时回退预览图；指定 `url` 时返回已验证的最终 HTTPS
 `googleusercontent.com` 图片 URL（仅解析文本中转，不下载图片字节）。`stream`、`size`、`quality` 和
 `style` 有意不支持。Responses API 的 `tools` 中也可使用
 `{ "type": "image_generation" }`，会在保留文本输出的同时追加一个带 base64 结果的
 `image_generation_call`。
 
+Chat Completions 会识别最新用户消息中类似 `generate an image of ...` 的明确图片生成请求，
+并使用同一图片生成路径。流式客户端即使携带函数工具或在对话历史中保留旧图片附件，也会
+收到浏览器可访问的 Markdown 图片 URL。历史附件不会被当作图片编辑输入。
+
 base64 输出仅使用 Chrome 模拟下载 HTTPS 的精确或子域
 `googleusercontent.com` 地址：最多 3 次重定向、10 MiB，且 PNG/JPEG/WebP 文件头必须
-与 HTTP Content-Type 一致。这些限制仅用于 Gemini 生成的输出，不改变其他图片输入 URL。
-配置项 `generated_image_max_bytes` 与 `generated_image_max_redirects` 可以进一步降低限制，
+与 HTTP Content-Type 一致。配置项 `generated_image_max_bytes` 与
+`generated_image_max_redirects` 可以进一步降低限制，
 但不能超过硬编码的 10 MiB / 3 次重定向上限。
 
 ## 已知限制
 
-- **图片输入需要 `curl_cffi`，且可能需要 Cookie**: 多模态输入使用 Gemini 网页端上传及 Chrome 模拟生成请求。上传或生成失败时，请配置 Gemini cookie。图片流式请求会返回一个完整结果，而非增量文本。
+- **图片请求需要 `curl_cffi`，且可能需要 Cookie**: 多模态输入与图片生成输出使用 Chrome 模拟请求。上传或生成失败时，请配置 Gemini cookie。图片输入的流式请求会返回一个完整结果，而非增量文本。
 - **图片生成协议可能变化**: 图片输出依赖 Gemini 未公开的 GUI 请求体和全尺寸 RPC。全尺寸 RPC 不可用时会回退到已验证预览图；未实现图片编辑、缓存或代理。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
@@ -267,7 +280,7 @@ base64 输出仅使用 Chrome 模拟下载 HTTPS 的精确或子域
 ## 系统要求
 
 - Python 3.8+
-- `curl_cffi` (`pip install -r requirements.txt`) — Gemini 图片输入所需
+- `curl_cffi` (`pip install -r requirements.txt`) — Gemini 图片输入与输出所需
 - `httpx` (`pip install httpx`) — 用于文本流式请求
 - 需要能访问 `gemini.google.com` (部分地区需代理)
 

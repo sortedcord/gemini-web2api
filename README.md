@@ -16,7 +16,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python with `curl_cffi` for Chrome-compatible image requests
+- **Cross-Platform**: Python service with `curl_cffi` for Chrome-compatible image requests
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
@@ -39,7 +39,7 @@ Server starts at `http://localhost:8081/v1`.
 |-------|-------|
 | Base URL | `http://localhost:8081/v1` |
 | API Key | any `api_keys` value from `config.json`; anything if not configured |
-| Model | `gemini-3.5-flash-thinking` |
+| Model | `gemini-3.6-flash` |
 
 ### curl
 
@@ -49,13 +49,13 @@ Server starts at `http://localhost:8081/v1`.
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"Hello!"}],"reasoning":{"effort":"low"}}'
 ```
 
 #### PowerShell (Windows)
 
 ```powershell
-curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
+curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.6-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"reasoning\":{\"effort\":\"low\"}}"
 ```
 
 > Note: On Windows PowerShell, use `curl.exe` and `--%` so PowerShell does not reinterpret JSON quoting or curl options.
@@ -66,7 +66,7 @@ curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: applica
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
+    model="gemini-3.6-flash",
     messages=[{"role": "user", "content": "Explain quantum computing"}]
 )
 print(resp.choices[0].message.content)
@@ -89,23 +89,31 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
-| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
-| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
+| `gemini-3.5-flash-lite` | Gemini Chat Flash-Lite | varies |
+| `gemini-3.6-flash` | Gemini Chat Flash | varies |
+| `gemini-3.1-pro` | Gemini Chat Pro | varies |
 
-### Thinking Depth
+The list is captured from the authenticated Gemini Chat mode picker, not the
+public Gemini API catalogue. Existing legacy model names remain accepted as
+aliases but are not advertised.
 
-Append `@think=N` to any model name:
+### Reasoning
 
+Use the OpenAI-style `reasoning.effort` request parameter:
+
+| Effort | Gemini Chat route |
+|--------|-------------------|
+| `none`, `low` | Normal reasoning |
+| `medium`, `high` | Extended thinking |
+
+```json
+{"model":"gemini-3.6-flash","reasoning":{"effort":"medium"}}
 ```
-gemini-3.5-flash-thinking@think=0   # deepest (default)
-gemini-3.5-flash-thinking@think=2   # medium
-gemini-3.5-flash-thinking@think=4   # shallowest
-```
+
+Set `reasoning.think` to an integer to set the raw Gemini Web think value at
+payload slot 17, for example `{"reasoning":{"think":7}}`. The legacy
+`@think=N` model suffix remains supported and takes precedence over
+`reasoning.think`.
 
 ## Optional: Cookie for Pro
 
@@ -252,7 +260,10 @@ resp = client.chat.completions.create(
 ## Image Input
 
 OpenAI-style multimodal messages are supported for Chat Completions and the
-Responses API. Use either HTTP(S) image URLs or base64 data URLs:
+Responses API. Use either public HTTPS image URLs or base64 data URLs. Remote
+images are limited to 10 MiB and three redirects; private, loopback, link-local,
+and non-image responses are rejected. Remote image downloads use a direct,
+DNS-pinned connection instead of the configured proxy to preserve this boundary.
 
 ```python
 resp = client.chat.completions.create(
@@ -270,7 +281,9 @@ resp = client.chat.completions.create(
 ## Image Output
 
 `POST /v1/images/generations` accepts a text `prompt`, optional `model`, and `n: 1`.
-It returns one OpenAI-compatible item. `response_format` defaults to `b64_json`, which
+The `model` field is accepted for client compatibility; Gemini Web selects its image route
+independently of the text-model catalog. The endpoint returns one OpenAI-compatible item.
+`response_format` defaults to `b64_json`, which
 prefers Gemini's full-size RPC URL and falls back to preview when that RPC is unavailable.
 Use `url` to return a validated final HTTPS `googleusercontent.com` image URL (text
 mediators are resolved without downloading the image bytes).
@@ -278,16 +291,21 @@ mediators are resolved without downloading the image bytes).
 also recognizes `{ "type": "image_generation" }` in `tools` and emits one
 `image_generation_call` containing base64 output alongside any generated text.
 
+Chat Completions routes explicit requests such as `generate an image of ...` in the latest
+user turn through the same image-generation path. It returns a browser-accessible Markdown
+image URL, including for streaming clients that send function tools or retain older image
+attachments in conversation history. Historical attachments are not treated as image edits.
+
 For base64 output, the server downloads only HTTPS exact/subdomain
 `googleusercontent.com` URLs with Chrome impersonation, at most three redirects and 10 MiB.
-PNG, JPEG, and WebP bytes and their HTTP content type must agree. This applies only to
-Gemini-generated output, not unrelated image input URLs. `generated_image_max_bytes` and
+PNG, JPEG, and WebP bytes and their HTTP content type must agree.
+`generated_image_max_bytes` and
 `generated_image_max_redirects` in configuration can lower these limits, but cannot raise
 the hard 10 MiB / three-redirect caps.
 
 ## Limitations
 
-- **Image input requires `curl_cffi` and may require cookies**: Multimodal input uses Gemini Web's upload and Chrome-impersonated generation requests. If upload or generation fails, configure a Gemini cookie. Image streaming returns one complete generated result rather than incremental text.
+- **Image requests require `curl_cffi` and may require cookies**: Multimodal input and generated-image output use Chrome-impersonated requests. If upload or generation fails, configure a Gemini cookie. Image input streaming returns one complete result rather than incremental text.
 - **Generated image protocol can change**: Image output uses Gemini's undocumented GUI payload and full-size RPC. The server falls back to the validated preview when full-size RPC resolution is unavailable; edits, caching, and proxying are not implemented.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
@@ -296,7 +314,7 @@ the hard 10 MiB / three-redirect caps.
 ## Requirements
 
 - Python 3.8+
-- `curl_cffi` (`pip install -r requirements.txt`) — required for Gemini image input
+- `curl_cffi` (`pip install -r requirements.txt`) — required for Gemini image input and output
 - `httpx` (`pip install httpx`) — used for text streaming requests
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
