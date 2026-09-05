@@ -88,7 +88,7 @@ gemini
 
 ### 推理
 
-使用 OpenAI 风格的 `reasoning.effort` 参数，或兼容的 `reasoning_effort` 字符串:
+使用 OpenAI 风格的 `reasoning.effort` 参数:
 
 | Effort | Gemini Chat 路由 |
 |--------|-------------------|

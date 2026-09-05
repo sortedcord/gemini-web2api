@@ -99,8 +99,7 @@ aliases but are not advertised.
 
 ### Reasoning
 
-Use the OpenAI-style `reasoning.effort` request parameter, or the compatible
-`reasoning_effort` string:
+Use the OpenAI-style `reasoning.effort` request parameter:
 
 | Effort | Gemini Chat route |
 |--------|-------------------|
