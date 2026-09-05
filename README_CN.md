@@ -83,6 +83,11 @@ gemini
 | `gemini-3.6-flash` | Gemini Chat Flash | 不定 |
 | `gemini-3.1-pro` | Gemini Chat Pro | 不定 |
 
+> [!NOTE]
+> **Gemini Flash 模型名称:** `gemini-3.6-flash` 是 Gemini Chat 界面暴露的兼容名称，
+> 但底层模型目前自我标识为 **Gemini 3.8 Flash**。Google 尚未更新界面或 API 标签，
+> 因此选择该模型时请继续使用 `gemini-3.6-flash`。
+
 该列表来自已认证 Gemini Chat 的模式选择器，而非公开 Gemini API 目录。旧模型名仍作为
 别名接受，但不会在模型列表中显示。
 
@@ -126,7 +131,8 @@ Responses API 使用标准的 `previous_response_id`。Chat Completions 可以�
 数据库中。不使用来源 IP 或模糊语义匹配。没有安全命名空间的请求会回退到新对话，
 保持无状态客户端的兼容性。
 
-如需在容器重启后保留状态，请将父目录挂载为持久化存储:
+如需在容器重启后保留状态，请将父目录挂载为持久化存储。当前实现范围和剩余限制请参阅
+[`MULTI_TURN_IMPLEMENTATION_STATUS.md`](MULTI_TURN_IMPLEMENTATION_STATUS.md):
 
 ```yaml
 volumes:

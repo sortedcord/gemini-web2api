@@ -93,6 +93,12 @@ Supports Google native API endpoints:
 | `gemini-3.6-flash` | Gemini Chat Flash | varies |
 | `gemini-3.1-pro` | Gemini Chat Pro | varies |
 
+> [!NOTE]
+> **Gemini Flash model naming:** `gemini-3.6-flash` is the compatibility name
+> exposed by the Gemini Chat interface, but the underlying model currently
+> identifies itself as **Gemini 3.8 Flash**. Google has not updated the
+> interface/API label yet, so keep using `gemini-3.6-flash` when selecting it.
+
 The list is captured from the authenticated Gemini Chat mode picker, not the
 public Gemini API catalogue. Existing legacy model names remain accepted as
 aliases but are not advertised.
@@ -141,7 +147,8 @@ or fuzzy semantic matching is used. Requests without a safe namespace fall
 back to a new conversation, preserving compatibility with stateless clients.
 
 Mount the parent directory as persistent storage when state must survive
-container restarts:
+container restarts. See [`MULTI_TURN_IMPLEMENTATION_STATUS.md`](MULTI_TURN_IMPLEMENTATION_STATUS.md)
+for the currently implemented scope and remaining limitations.
 
 ```yaml
 volumes:
