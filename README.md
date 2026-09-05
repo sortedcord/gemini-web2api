@@ -39,7 +39,7 @@ Server starts at `http://localhost:8081/v1`.
 |-------|-------|
 | Base URL | `http://localhost:8081/v1` |
 | API Key | any `api_keys` value from `config.json`; anything if not configured |
-| Model | `gemini-3.5-flash-thinking` |
+| Model | `gemini-3.6-flash` |
 
 ### curl
 
@@ -49,13 +49,13 @@ Server starts at `http://localhost:8081/v1`.
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"Hello!"}],"reasoning":{"effort":"low"}}'
 ```
 
 #### PowerShell (Windows)
 
 ```powershell
-curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
+curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.6-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"reasoning\":{\"effort\":\"low\"}}"
 ```
 
 > Note: On Windows PowerShell, use `curl.exe` and `--%` so PowerShell does not reinterpret JSON quoting or curl options.
@@ -66,7 +66,7 @@ curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: applica
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
+    model="gemini-3.6-flash",
     messages=[{"role": "user", "content": "Explain quantum computing"}]
 )
 print(resp.choices[0].message.content)
@@ -89,23 +89,31 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
-| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
-| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
+| `gemini-3.5-flash-lite` | Gemini Chat Flash-Lite | varies |
+| `gemini-3.6-flash` | Gemini Chat Flash | varies |
+| `gemini-3.1-pro` | Gemini Chat Pro | varies |
 
-### Thinking Depth
+The list is captured from the authenticated Gemini Chat mode picker, not the
+public Gemini API catalogue. Existing legacy model names remain accepted as
+aliases but are not advertised.
 
-Append `@think=N` to any model name:
+### Reasoning
 
+Use the OpenAI-style `reasoning.effort` request parameter, or the compatible
+`reasoning_effort` string:
+
+| Effort | Gemini Chat route |
+|--------|-------------------|
+| `none`, `low` | Normal reasoning |
+| `medium`, `high` | Extended thinking |
+
+```json
+{"model":"gemini-3.6-flash","reasoning":{"effort":"medium"}}
 ```
-gemini-3.5-flash-thinking@think=0   # deepest (default)
-gemini-3.5-flash-thinking@think=2   # medium
-gemini-3.5-flash-thinking@think=4   # shallowest
-```
+
+Append `@think=N` to a model name to set the raw Gemini Web think value at
+payload slot 17. This advanced override is retained for compatibility and takes
+precedence over the default think value; it can be combined with `reasoning`.
 
 ## Optional: Cookie for Pro
 

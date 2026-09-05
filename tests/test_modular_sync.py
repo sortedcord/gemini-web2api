@@ -25,6 +25,7 @@ from gemini_web2api.generated_image import (
     resolve_generated_image_url,
     validate_generated_image_url,
 )
+from gemini_web2api.models import MODELS, resolve_model
 from gemini_web2api.multimodal import _get_page_tokens, fetch_image_bytes
 from gemini_web2api.server import GeminiHandler, ThreadedServer, _chat_image_prompt
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
@@ -180,6 +181,35 @@ class UpstreamErrorTests(unittest.TestCase):
             list(generate_stream("hello", 1, 4))
 
         get_client.return_value.stream.assert_called_once()
+
+
+class ModelResolutionTests(unittest.TestCase):
+    def test_advertises_captured_gemini_chat_modes(self):
+        self.assertEqual(
+            set(MODELS),
+            {"gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.1-pro"},
+        )
+        self.assertEqual(resolve_model("gemini-3.5-flash-lite")[:3],
+                         ("gemini-3.5-flash-lite", 6, 0))
+        self.assertEqual(resolve_model("gemini-3.6-flash")[:3],
+                         ("gemini-3.6-flash", 1, 0))
+        self.assertEqual(resolve_model("gemini-3.1-pro")[:3],
+                         ("gemini-3.1-pro", 3, 0))
+
+    def test_reasoning_effort_and_explicit_think_override(self):
+        self.assertEqual(
+            resolve_model("gemini-3.6-flash", {"effort": "low"})[4], {80: 1}
+        )
+        self.assertEqual(
+            resolve_model("gemini-3.6-flash", {"effort": "medium"})[4], {80: 2}
+        )
+        self.assertEqual(
+            resolve_model("gemini-3.1-pro@think=7", "high")[2:],
+            (7, None, {80: 2}),
+        )
+        self.assertIn("reasoning effort", resolve_model(
+            "gemini-3.6-flash", {"effort": "invalid"}
+        )[3])
 
 
 class GeneratedImageTests(unittest.TestCase):

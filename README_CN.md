@@ -79,23 +79,28 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
-| `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
-| `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
-| `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
-| `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
-| `gemini-auto` | 自动选择模型 | 不定 |
-| `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
+| `gemini-3.5-flash-lite` | Gemini Chat Flash-Lite | 不定 |
+| `gemini-3.6-flash` | Gemini Chat Flash | 不定 |
+| `gemini-3.1-pro` | Gemini Chat Pro | 不定 |
 
-### 思考深度
+该列表来自已认证 Gemini Chat 的模式选择器，而非公开 Gemini API 目录。旧模型名仍作为
+别名接受，但不会在模型列表中显示。
 
-在模型名后追加 `@think=N`:
+### 推理
 
+使用 OpenAI 风格的 `reasoning.effort` 参数，或兼容的 `reasoning_effort` 字符串:
+
+| Effort | Gemini Chat 路由 |
+|--------|-------------------|
+| `none`, `low` | 常规推理 |
+| `medium`, `high` | Extended thinking |
+
+```json
+{"model":"gemini-3.6-flash","reasoning":{"effort":"medium"}}
 ```
-gemini-3.5-flash-thinking@think=0   # 最深 (默认)
-gemini-3.5-flash-thinking@think=2   # 中等
-gemini-3.5-flash-thinking@think=4   # 最浅
-```
+
+可在模型名后追加 `@think=N` 设置 Gemini Web 负载第 17 槽的原始 think 值。这个高级
+兼容覆盖会优先于默认 think 值，并可与 `reasoning` 组合使用。
 
 ## 可选: Cookie 配置 (Pro 模型)
 
